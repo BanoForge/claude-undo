@@ -206,6 +206,32 @@ class RestoreTests(Base):
         self.assertGreater(got[0]["id"], got[1]["id"])
 
 
+class DiffTests(Base):
+    def test_diff_shows_removed_and_added_lines(self):
+        path = self.make("notes.md", "keep\nold line\n")
+        self.store.save(path, "Edit")
+        with open(path, "w") as f:
+            f.write("keep\nnew line\n")
+        out = self.store.diff(path)
+        self.assertIn("-old line", out)
+        self.assertIn("+new line", out)
+
+    def test_diff_of_deleted_file_shows_all_lines_removed(self):
+        path = self.make("notes.md", "only line\n")
+        self.store.save(path, "Bash")
+        os.remove(path)
+        self.assertIn("-only line", self.store.diff(path))
+
+    def test_diff_without_changes_says_identical(self):
+        path = self.make("notes.md", "same\n")
+        self.store.save(path, "Edit")
+        self.assertEqual(self.store.diff(path), "")
+
+    def test_diff_unknown_path_raises(self):
+        with self.assertRaises(cu.UndoError):
+            self.store.diff(os.path.join(self.work, "never.md"))
+
+
 class CleanTests(Base):
     def test_clean_removes_old_copies_only(self):
         path = self.make("notes.md")
@@ -245,6 +271,19 @@ class CliTests(Base):
         self.assertEqual(len(ours), 1)
         self.assertEqual(len(data["hooks"]["PreToolUse"]), 2)
         self.assertTrue(os.path.exists(settings + ".before-claude-undo"))
+
+    def test_diff_command_prints_changes_and_fails_on_unknown_file(self):
+        path = self.make("notes.md", "old\n")
+        self.store.save(path, "Edit")
+        with open(path, "w") as f:
+            f.write("new\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cu.main(["diff", path], root=self.root)
+        self.assertEqual(code, 0)
+        self.assertIn("+new", out.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cu.main(["diff", os.path.join(self.work, "never.md")], root=self.root), 1)
 
     def test_installed_command_never_blocks_when_script_is_gone(self):
         # Exit code 2 from a PreToolUse hook blocks the tool call, and python

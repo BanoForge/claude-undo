@@ -17,6 +17,7 @@ Usage:
   claude_undo.py install [--settings PATH]    add the hook to Claude Code settings
   claude_undo.py uninstall [--settings PATH]  remove it again
   claude_undo.py list [PATH]                  copies, newest first, optionally under PATH
+  claude_undo.py diff PATH [--id ID]          what changed since the latest (or a given) copy
   claude_undo.py restore PATH [--id ID]       put back the latest (or a given) copy
   claude_undo.py clean [--days N]             delete copies older than N days
   claude_undo.py hook                         what Claude Code runs; reads JSON on stdin
@@ -24,6 +25,7 @@ Usage:
 
 import argparse
 import datetime
+import difflib
 import glob
 import json
 import os
@@ -137,7 +139,8 @@ class Store:
             items = [e for e in items if e["path"] == under or e["path"].startswith(under.rstrip(os.sep) + os.sep)]
         return sorted(items, key=lambda e: e["id"], reverse=True)
 
-    def restore(self, path, entry_id=None):
+    def _find(self, path, entry_id=None):
+        """The newest copy of path (or the one with entry_id) and its file in the store."""
         path = os.path.abspath(os.path.expanduser(path))
         candidates = [e for e in self.entries() if e["path"] == path]
         if entry_id:
@@ -148,6 +151,26 @@ class Store:
         source = os.path.join(self.root, entry["backup"])
         if not os.path.isfile(source):
             raise UndoError("the copy %s is missing from %s" % (entry["id"], self.root))
+        return path, entry, source
+
+    def diff(self, path, entry_id=None):
+        """Unified diff from the saved copy to the file as it is now; "" when identical."""
+        path, entry, source = self._find(path, entry_id)
+
+        def lines(p):
+            if not os.path.isfile(p):
+                return []
+            with open(p, encoding="utf-8", errors="replace") as f:
+                return f.readlines()
+
+        return "".join(difflib.unified_diff(
+            lines(source), lines(path),
+            fromfile="%s (copy %s)" % (path, entry["id"]),
+            tofile="%s (now)" % path if os.path.isfile(path) else "%s (deleted)" % path,
+        ))
+
+    def restore(self, path, entry_id=None):
+        path, entry, source = self._find(path, entry_id)
         # Save what is there now first, so a restore can be undone the same way.
         if os.path.isfile(path):
             self.save(path, "restore")
@@ -456,9 +479,10 @@ def main(argv=None, stdin_text=None, root=None):
     p = sub.add_parser("list")
     p.add_argument("path", nargs="?")
     p.add_argument("-n", type=int, default=30, help="how many to show (default 30)")
-    p = sub.add_parser("restore")
-    p.add_argument("path")
-    p.add_argument("--id")
+    for name in ("restore", "diff"):
+        p = sub.add_parser(name)
+        p.add_argument("path")
+        p.add_argument("--id")
     p = sub.add_parser("clean")
     p.add_argument("--days", type=int)
     args = parser.parse_args(argv)
@@ -483,6 +507,13 @@ def main(argv=None, stdin_text=None, root=None):
             print("claude-undo: %s" % err, file=sys.stderr)
             return 1
         print("Restored %s from the copy taken %s (%s)." % (e["path"], e["time"][:19].replace("T", " "), e["id"]))
+    elif args.cmd == "diff":
+        try:
+            out = store.diff(args.path, args.id)
+        except UndoError as err:
+            print("claude-undo: %s" % err, file=sys.stderr)
+            return 1
+        print(out if out else "No changes since that copy.", end="" if out else "\n")
     elif args.cmd == "clean":
         removed = store.clean(args.days)
         print("Removed %d copies older than %d days." % (removed, args.days if args.days is not None else store.config["keep_days"]))

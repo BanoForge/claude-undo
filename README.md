@@ -48,6 +48,7 @@ alias claude-undo="python3 ~/claude-undo/claude_undo.py"
 ```bash
 claude-undo list                         # last 30 copies, newest first
 claude-undo list ~/thesis -n 100         # only files under a folder
+claude-undo diff ~/thesis/notes.md       # what changed since the newest copy
 claude-undo restore ~/thesis/notes.md    # put back the newest copy
 claude-undo restore ~/thesis/notes.md --id 20261026-123028-363384
 claude-undo clean --days 30              # delete old copies now
