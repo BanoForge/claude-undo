@@ -2,6 +2,10 @@
 
 An undo history for every file Claude Code changes, in folders with or without git.
 
+![claude-undo in 21 seconds: Claude deletes a thesis chapter with rm, /rewind cannot help, claude-undo restores it](docs/demo.gif)
+
+(21-second video with sound: [docs/demo.mp4](docs/demo.mp4))
+
 Claude Code is great at editing files. It is also happy to `rm` the wrong one or run `sed -i` across a folder you never committed. `claude-undo` is a small hook that copies each file just before Claude Code touches it, plus two commands to get it back:
 
 ```bash

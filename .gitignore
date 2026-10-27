@@ -1,4 +1,5 @@
 .e2e/
+brag-output/
 LAUNCH.md
 CLAUDE.local.md
 __pycache__/
