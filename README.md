@@ -33,7 +33,7 @@ Git is still the best undo. This is for everything that is not in git yet: a the
 Requires Python 3.9 or newer and macOS or Linux.
 
 ```bash
-git clone https://github.com/BlendiFevziu/claude-undo.git ~/claude-undo
+git clone https://github.com/BanoForge/claude-undo.git ~/claude-undo
 python3 ~/claude-undo/claude_undo.py install
 ```
 
