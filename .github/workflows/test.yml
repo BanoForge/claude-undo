@@ -11,6 +11,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.9", "3.13"]
+        # setup-python has no 3.9 build for Ubuntu 26.04 (ubuntu-latest since late October 2026).
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
