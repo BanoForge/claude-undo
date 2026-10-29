@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude-undo: an undo history for folders Claude Code edits, git or not.
 
-A PreToolUse hook copies every file just before Claude Code changes it, through
+A PreToolUse hook copies eligible existing files before supported changes through
 Edit, Write, MultiEdit, NotebookEdit, or a shell command that names the file
 (rm, mv, cp, sed -i, perl -i, truncate, tee, and > redirects). Copies are listed
 and restored from the command line.
@@ -20,18 +20,27 @@ Usage:
   claude_undo.py diff PATH [--id ID]          what changed since the latest (or a given) copy
   claude_undo.py restore PATH [--id ID]       put back the latest (or a given) copy
   claude_undo.py clean [--days N]             delete copies older than N days
+  claude_undo.py status                       recent recorded hook errors
   claude_undo.py hook                         what Claude Code runs; reads JSON on stdin
 """
 
 import argparse
+import contextlib
 import datetime
 import difflib
+import fcntl
 import glob
+import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
+import stat
 import sys
+import tempfile
+import time
+import uuid
 
 DEFAULT_ROOT = os.environ.get("CLAUDE_UNDO_DIR") or os.path.expanduser("~/.claude-undo")
 DEFAULT_SETTINGS = os.path.expanduser("~/.claude/settings.json")
@@ -41,7 +50,7 @@ BACKUP_SUFFIX = ".before-claude-undo"
 DEFAULT_CONFIG = {
     "keep_days": 90,
     "max_file_mb": 5,
-    # rm -r on a folder with more files than this is skipped rather than copied.
+    # A Bash call exceeding this many eligible targets is skipped in full.
     "max_dir_files": 200,
     "exclude_dirs": [
         ".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -63,18 +72,157 @@ def _parse_time(text):
     return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%f")
 
 
+def _fingerprint(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_nlink,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+@contextlib.contextmanager
+def _regular_file(path, dir_fd=None):
+    # NONBLOCK avoids hanging if a file was replaced with a FIFO.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise UndoError("not a regular file: %s" % path)
+        yield source
+
+
+@contextlib.contextmanager
+def _parent_directory(path, create=False):
+    """Pin each directory without following links; recheck ancestry before commit."""
+    parts = path.split(os.sep)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = [os.open(os.sep, flags)]
+    edges = []
+    try:
+        for part in parts[1:-1]:
+            if not part:
+                continue
+            parent = descriptors[-1]
+            try:
+                child = os.open(part, flags, dir_fd=parent)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, dir_fd=parent)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=parent)
+            except OSError as err:
+                raise UndoError("unsafe parent directory in %s: %s" % (path, err))
+            descriptors.append(child)
+            edges.append((parent, part, child))
+
+        def verify():
+            for parent, name, child in edges:
+                actual = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                pinned = os.fstat(child)
+                if not stat.S_ISDIR(actual.st_mode) or (actual.st_dev, actual.st_ino) != (pinned.st_dev, pinned.st_ino):
+                    raise UndoError("parent directory changed during restore: %s" % path)
+        yield descriptors[-1], parts[-1], verify
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def _destination_state(parent, name):
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise UndoError("unsafe restore destination %s: expected a single-link regular file or an absent path; symlinks, hard links and directories are refused" % name)
+    return _fingerprint(info)
+
+
+def _copy_stream(source, destination):
+    before = os.fstat(source.fileno())
+    digest, size = hashlib.sha256(), 0
+    while True:
+        block = source.read(1024 * 1024)
+        if not block:
+            break
+        destination.write(block)
+        digest.update(block)
+        size += len(block)
+    if _fingerprint(before) != _fingerprint(os.fstat(source.fileno())):
+        raise UndoError("source changed while copying; retry when writes have stopped")
+    destination.flush()
+    os.fchmod(destination.fileno(), stat.S_IMODE(before.st_mode))
+    os.utime(destination.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.fsync(destination.fileno())
+    return size, digest.hexdigest()
+
+
+def _record_error(root, operation, error):
+    """Best effort only: an unavailable store cannot record its own failure."""
+    try:
+        root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+        os.makedirs(root, exist_ok=True)
+        event = {"time": datetime.datetime.now().isoformat(), "operation": operation,
+                 "error": str(error)[:4000]}
+        fd = os.open(os.path.join(root, "errors.jsonl"),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (json.dumps(event) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
 class Store:
-    """Copies live in <root>/files/<YYYY-MM-DD>/, one line per copy in index.jsonl."""
+    """All manifest operations share a POSIX process lock. Blobs are immutable."""
 
     def __init__(self, root=DEFAULT_ROOT):
-        self.root = os.path.abspath(os.path.expanduser(root))
+        # A deliberately configured store alias is resolved once. Restore target
+        # paths are not resolved: a link there must be refused, never followed.
+        self.root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
         self.index_path = os.path.join(self.root, "index.jsonl")
         self.config = dict(DEFAULT_CONFIG)
         try:
             with open(os.path.join(self.root, "config.json")) as f:
-                self.config.update(json.load(f))
-        except (OSError, ValueError):
+                config = json.load(f)
+            if not isinstance(config, dict):
+                raise ValueError("expected an object")
+            self.config.update(config)
+            for key in ("keep_days", "max_file_mb", "max_dir_files"):
+                value = self.config[key]
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("%s must be a finite nonnegative number" % key)
+            if type(self.config["max_dir_files"]) is not int:
+                raise ValueError("max_dir_files must be an integer")
+            for key in ("exclude_dirs", "exclude_names", "exclude_suffixes", "exclude_prefixes"):
+                value = self.config[key]
+                if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                    raise ValueError("%s must be a list of strings" % key)
+        except FileNotFoundError:
             pass
+        except (ValueError, OSError, OverflowError) as err:
+            raise UndoError("cannot load config in %s: %s" % (self.root, err))
+
+    @contextlib.contextmanager
+    def _locked(self):
+        fd = None
+        try:
+            os.makedirs(self.root, exist_ok=True)
+            fd = os.open(os.path.join(self.root, ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise UndoError("backup store is busy; retry: %s" % self.root)
+                    time.sleep(0.02)
+            yield
+        except OSError as err:
+            raise UndoError("backup operation failed: %s" % err) from err
+        finally:
+            if fd is not None:
+                os.close(fd)  # Closing releases the process lock, including on errors.
 
     def is_excluded(self, path):
         cfg = self.config
@@ -95,126 +243,235 @@ class Store:
         except OSError:
             return False
 
+    def _write_index(self, entries):
+        fd, temp = tempfile.mkstemp(prefix=".index-", dir=self.root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, self.index_path)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
     def save(self, path, tool, session="", now=None):
+        with self._locked(), _regular_file(path) as source:
+            return self._save_locked(path, source, tool, session, now)
+
+    def _save_locked(self, path, source, tool, session="", now=None):
+        entries = self._read_index()
+        ids = {e["id"] for e in entries}
         now = now or datetime.datetime.now()
-        entry_id = now.strftime("%Y%m%d-%H%M%S-%f")
-        while any(e["id"] == entry_id for e in self._read_index()):
-            now += datetime.timedelta(microseconds=1)
+        while True:
             entry_id = now.strftime("%Y%m%d-%H%M%S-%f")
-        rel = os.path.join("files", now.strftime("%Y-%m-%d"), "%s__%s" % (entry_id, os.path.basename(path)))
-        dest = os.path.join(self.root, rel)
+            rel = os.path.join("files", now.strftime("%Y-%m-%d"), "%s__%s" % (entry_id, os.path.basename(path)))
+            dest = os.path.join(self.root, rel)
+            if entry_id not in ids and not os.path.lexists(dest):
+                break
+            now += datetime.timedelta(microseconds=1)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.copy2(path, dest)
-        entry = {
-            "id": entry_id,
-            "time": now.strftime("%Y-%m-%dT%H:%M:%S.%f"),
-            "path": path,
-            "backup": rel,
-            "size": os.path.getsize(dest),
-            "tool": tool,
-            "session": session,
-        }
-        with open(self.index_path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        return entry
+        fd, temp = tempfile.mkstemp(prefix=".copy-", dir=os.path.dirname(dest))
+        installed = False
+        try:
+            with os.fdopen(fd, "wb") as out:
+                size, digest = _copy_stream(source, out)
+            entry = {"id": entry_id, "time": now.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                     "path": os.path.abspath(path), "backup": rel, "size": size,
+                     "tool": tool, "session": session, "format": 2, "sha256": digest}
+            os.replace(temp, dest)
+            installed = True
+            self._write_index(entries + [entry])
+            return entry
+        except Exception:
+            if installed:
+                os.unlink(dest)  # Index commit failed; do not advertise this copy.
+            raise
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
 
     def _read_index(self):
-        entries = []
+        entries, seen = [], set()
         try:
-            with open(self.index_path) as f:
-                for line in f:
+            with open(self.index_path, encoding="utf-8") as f:
+                for number, line in enumerate(f, 1):
                     try:
-                        entries.append(json.loads(line))
-                    except ValueError:
-                        continue
-        except OSError:
+                        e = json.loads(line)
+                        if not isinstance(e, dict):
+                            raise ValueError("expected an object")
+                        for key in ("id", "time", "path", "backup", "tool", "session"):
+                            if not isinstance(e.get(key), str):
+                                raise ValueError("invalid %s" % key)
+                        _parse_time(e["time"])
+                        if not os.path.isabs(e["path"]) or type(e.get("size")) is not int or e["size"] < 0:
+                            raise ValueError("invalid path or size")
+                        if not e["backup"].startswith("files/") or ".." in e["backup"].split("/") or os.path.normpath(e["backup"]) != e["backup"]:
+                            raise ValueError("unsafe backup path")
+                        if not e["id"] or e["id"] in seen:
+                            raise ValueError("empty or duplicate ID")
+                        if e.get("format", 1) not in (1, 2):
+                            raise ValueError("unsupported entry format")
+                        digest = e.get("sha256")
+                        if digest is not None or e.get("format") == 2:
+                            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                                raise ValueError("invalid or missing sha256")
+                        seen.add(e["id"])
+                        entries.append(e)
+                    except (ValueError, TypeError) as err:
+                        raise UndoError("invalid backup index line %d: %s" % (number, err)) from err
+        except FileNotFoundError:
             pass
+        except UnicodeError as err:
+            raise UndoError("invalid backup index encoding: %s" % err) from err
         return entries
 
     def entries(self, under=None):
-        """Copies newest first, optionally only for files at or below `under`."""
-        items = self._read_index()
+        with self._locked():
+            items = self._read_index()
         if under:
             under = os.path.abspath(os.path.expanduser(under))
             items = [e for e in items if e["path"] == under or e["path"].startswith(under.rstrip(os.sep) + os.sep)]
         return sorted(items, key=lambda e: e["id"], reverse=True)
 
     def _find(self, path, entry_id=None):
-        """The newest copy of path (or the one with entry_id) and its file in the store."""
         path = os.path.abspath(os.path.expanduser(path))
-        candidates = [e for e in self.entries() if e["path"] == path]
-        if entry_id:
-            candidates = [e for e in candidates if e["id"] == entry_id]
+        candidates = [e for e in self._read_index() if e["path"] == path and (not entry_id or e["id"] == entry_id)]
         if not candidates:
             raise UndoError("no saved copy of %s%s" % (path, " with id " + entry_id if entry_id else ""))
-        entry = candidates[0]
-        source = os.path.join(self.root, entry["backup"])
-        if not os.path.isfile(source):
-            raise UndoError("the copy %s is missing from %s" % (entry["id"], self.root))
-        return path, entry, source
+        entry = max(candidates, key=lambda e: e["id"])
+        return path, entry, os.path.join(self.root, entry["backup"])
 
-    def diff(self, path, entry_id=None):
-        """Unified diff from the saved copy to the file as it is now; "" when identical."""
-        path, entry, source = self._find(path, entry_id)
+    @contextlib.contextmanager
+    def _backup(self, source):
+        try:
+            with _parent_directory(source) as (parent, name, verify):
+                with _regular_file(name, dir_fd=parent) as f:
+                    verify()
+                    yield f
+        except FileNotFoundError as err:
+            raise UndoError("saved copy is missing: %s" % source) from err
 
-        def lines(p):
-            if not os.path.isfile(p):
-                return []
-            with open(p, encoding="utf-8", errors="replace") as f:
-                return f.readlines()
+    def _verify_copy(self, entry, size, digest, allow_unverified):
+        if size != entry["size"]:
+            raise UndoError("corrupted copy %s: size mismatch" % entry["id"])
+        if "sha256" in entry:
+            if digest != entry["sha256"]:
+                raise UndoError("corrupted copy %s: SHA-256 mismatch" % entry["id"])
+        elif not allow_unverified:
+            raise UndoError("legacy copy %s has no checksum; use --allow-unverified only after independent inspection" % entry["id"])
 
-        return "".join(difflib.unified_diff(
-            lines(source), lines(path),
-            fromfile="%s (copy %s)" % (path, entry["id"]),
-            tofile="%s (now)" % path if os.path.isfile(path) else "%s (deleted)" % path,
-        ))
+    def diff(self, path, entry_id=None, allow_unverified=False):
+        with self._locked():
+            path, entry, source = self._find(path, entry_id)
+            with self._backup(source) as f:
+                data = f.read()
+            self._verify_copy(entry, len(data), hashlib.sha256(data).hexdigest(), allow_unverified)
+            before = data.decode("utf-8", errors="replace").splitlines(keepends=True)
+            after = []
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    after = f.readlines()
+            return "".join(difflib.unified_diff(before, after,
+                fromfile="%s (copy %s)" % (path, entry["id"]),
+                tofile="%s (now)" % path if os.path.isfile(path) else "%s (deleted)" % path))
 
-    def restore(self, path, entry_id=None):
-        path, entry, source = self._find(path, entry_id)
-        # Save what is there now first, so a restore can be undone the same way.
-        if os.path.isfile(path):
-            self.save(path, "restore")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        shutil.copy2(source, path)
-        return entry
+    def restore(self, path, entry_id=None, allow_unverified=False):
+        # Walk the requested spelling too: normalizing link/../file first would
+        # erase a symlink component and could select a different destination.
+        requested = os.path.expanduser(path)
+        if not os.path.isabs(requested):
+            requested = os.path.join(os.getcwd(), requested)
+        with self._locked():
+            path, entry, source = self._find(path, entry_id)
+            with _parent_directory(requested, create=True) as (parent, name, verify):
+                state = _destination_state(parent, name)
+                temp = ".claude-undo-restore-" + uuid.uuid4().hex
+                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+                try:
+                    with os.fdopen(fd, "wb") as staged, self._backup(source) as original:
+                        size, digest = _copy_stream(original, staged)
+                        info = os.fstat(staged.fileno())
+                        staged_identity = (info.st_dev, info.st_ino)
+                    self._verify_copy(entry, size, digest, allow_unverified)
+                    verify()
+                    if _destination_state(parent, name) != state:
+                        raise UndoError("restore destination changed while preparing: %s" % path)
+                    if state is not None:
+                        with _regular_file(name, dir_fd=parent) as current:
+                            if _fingerprint(os.fstat(current.fileno())) != state:
+                                raise UndoError("restore destination changed before saving: %s" % path)
+                            self._save_locked(path, current, "restore")
+                    verify()
+                    if _destination_state(parent, name) != state:
+                        raise UndoError("restore destination changed before commit: %s" % path)
+                    os.replace(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+                    verify()
+                    final = _destination_state(parent, name)
+                    if final is None or final[:2] != staged_identity:
+                        raise UndoError("restore destination changed after commit: %s" % path)
+                finally:
+                    try:
+                        os.unlink(temp, dir_fd=parent)
+                    except FileNotFoundError:
+                        pass
+            return entry
 
     def clean(self, keep_days=None, now=None):
-        keep_days = self.config["keep_days"] if keep_days is None else keep_days
-        cutoff = (now or datetime.datetime.now()) - datetime.timedelta(days=keep_days)
-        keep, removed = [], 0
-        for e in self._read_index():
-            if _parse_time(e["time"]) < cutoff:
-                try:
-                    os.remove(os.path.join(self.root, e["backup"]))
-                except OSError:
-                    pass
-                removed += 1
-            else:
-                keep.append(e)
-        if removed:
-            tmp = self.index_path + ".tmp"
-            with open(tmp, "w") as f:
-                f.writelines(json.dumps(e) + "\n" for e in keep)
-            os.replace(tmp, self.index_path)
-            for d in glob.glob(os.path.join(self.root, "files", "*")):
-                if os.path.isdir(d) and not os.listdir(d):
-                    os.rmdir(d)
-        return removed
+        with self._locked():
+            return self._clean_locked(keep_days, now)
+
+    def _clean_locked(self, keep_days=None, now=None):
+        days = self.config["keep_days"] if keep_days is None else keep_days
+        if type(days) not in (int, float) or not math.isfinite(days) or days < 0:
+            raise UndoError("cleanup days must be finite and nonnegative")
+        cutoff = (now or datetime.datetime.now()) - datetime.timedelta(days=days)
+        items = self._read_index()
+        expired = [e for e in items if _parse_time(e["time"]) < cutoff]
+        if not expired:
+            return 0
+        # Commit discovery first. An interrupted unlink leaves an orphan rather
+        # than destroying a still-indexed copy. All writers hold the same lock.
+        self._write_index([e for e in items if _parse_time(e["time"]) >= cutoff])
+        failures = []
+        for e in expired:
+            try:
+                source = os.path.join(self.root, e["backup"])
+                with _parent_directory(source) as (parent, name, verify):
+                    verify()
+                    os.unlink(name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            except (OSError, UndoError) as err:
+                failures.append(str(err))
+        if failures:
+            raise UndoError("cleanup index committed, but expired files could not be deleted: %s" % "; ".join(failures))
+        return len(expired)
 
     def clean_daily(self):
-        """Run clean() at most once a day, from the hook."""
-        stamp = os.path.join(self.root, ".last-clean")
-        today = datetime.date.today().isoformat()
-        try:
-            with open(stamp) as f:
-                if f.read().strip() == today:
-                    return
-        except OSError:
-            pass
-        self.clean()
-        os.makedirs(self.root, exist_ok=True)
-        with open(stamp, "w") as f:
-            f.write(today)
+        with self._locked():
+            stamp = os.path.join(self.root, ".last-clean")
+            today = datetime.date.today().isoformat()
+            try:
+                with open(stamp) as f:
+                    if f.read().strip() == today:
+                        return
+            except FileNotFoundError:
+                pass
+            self._clean_locked()
+            with open(stamp, "w") as f:
+                f.write(today)
+
+    def status(self):
+        """Report recorded errors, not a claim that every tool call was covered."""
+        with self._locked():
+            self._read_index()
+            try:
+                with open(os.path.join(self.root, "errors.jsonl")) as f:
+                    return f.readlines()[-30:]
+            except FileNotFoundError:
+                return []
 
 
 # Shell parsing. Best effort by design: a command that hides its targets
@@ -391,10 +648,12 @@ def snapshot_from_payload(payload, store):
             try:
                 store.save(p, tool, payload.get("session_id") or "")
                 saved.append(p)
-            except OSError:
+            except (OSError, UndoError) as err:
+                _record_error(store.root, "save " + p, err)
                 continue
         return saved
-    except Exception:
+    except Exception as err:
+        _record_error(store.root, "snapshot", err)
         return []
 
 
@@ -460,15 +719,14 @@ def _human(size):
 
 def main(argv=None, stdin_text=None, root=None):
     argv = sys.argv[1:] if argv is None else argv
-    store = Store(root or DEFAULT_ROOT)
-
     if argv[:1] == ["hook"]:
         try:
+            store = Store(root or DEFAULT_ROOT)
             text = sys.stdin.read() if stdin_text is None else stdin_text
             snapshot_from_payload(json.loads(text), store)
             store.clean_daily()
-        except Exception:
-            pass
+        except Exception as err:
+            _record_error(root or DEFAULT_ROOT, "hook", err)
         return 0
 
     parser = argparse.ArgumentParser(prog="claude-undo", description="Undo history for files Claude Code changes.")
@@ -483,10 +741,20 @@ def main(argv=None, stdin_text=None, root=None):
         p = sub.add_parser(name)
         p.add_argument("path")
         p.add_argument("--id")
+        p.add_argument("--allow-unverified", action="store_true", help="allow legacy copies without a checksum; size is still checked")
     p = sub.add_parser("clean")
     p.add_argument("--days", type=int)
+    sub.add_parser("status", help="show recent recorded hook errors (not a coverage guarantee)")
     args = parser.parse_args(argv)
+    try:
+        store = Store(root or DEFAULT_ROOT)
+        return _run_command(args, store)
+    except (UndoError, OSError, ValueError, OverflowError) as err:
+        print("claude-undo: %s" % err, file=sys.stderr)
+        return 1
 
+
+def _run_command(args, store):
     if args.cmd == "install":
         changed = install(args.settings)
         print("Hook added to %s" % args.settings if changed else "Already installed in %s" % args.settings)
@@ -501,19 +769,21 @@ def main(argv=None, stdin_text=None, root=None):
         for e in items[: args.n]:
             print("%s  %s  %8s  %-12s %s" % (e["id"], e["time"][:19].replace("T", " "), _human(e["size"]), e["tool"], e["path"]))
     elif args.cmd == "restore":
-        try:
-            e = store.restore(args.path, args.id)
-        except UndoError as err:
-            print("claude-undo: %s" % err, file=sys.stderr)
-            return 1
+        e = store.restore(args.path, args.id, args.allow_unverified)
+        if "sha256" not in e:
+            print("Warning: legacy copy has no checksum; only size was verified.", file=sys.stderr)
         print("Restored %s from the copy taken %s (%s)." % (e["path"], e["time"][:19].replace("T", " "), e["id"]))
     elif args.cmd == "diff":
-        try:
-            out = store.diff(args.path, args.id)
-        except UndoError as err:
-            print("claude-undo: %s" % err, file=sys.stderr)
-            return 1
+        out = store.diff(args.path, args.id, args.allow_unverified)
+        if args.allow_unverified:
+            print("Warning: --allow-unverified permits legacy copies without checksum verification.", file=sys.stderr)
         print(out if out else "No changes since that copy.", end="" if out else "\n")
+    elif args.cmd == "status":
+        events = store.status()
+        print("Recent recorded hook errors in %s (history, not current health):" % store.root)
+        print("".join(events) if events else "No recorded errors. This does not verify backup coverage.", end="" if events else "\n")
+        if events:
+            return 1
     elif args.cmd == "clean":
         removed = store.clean(args.days)
         print("Removed %d copies older than %d days." % (removed, args.days if args.days is not None else store.config["keep_days"]))
